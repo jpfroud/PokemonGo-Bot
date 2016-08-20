@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 CATCH_STATUS_SUCCESS = 1
 CATCH_STATUS_FAILED = 2
 CATCH_STATUS_VANISHED = 3
+CATCH_STATUS_MISSED = 4
 
 ENCOUNTER_STATUS_SUCCESS = 1
 ENCOUNTER_STATUS_NOT_IN_RANGE = 5
@@ -53,6 +54,8 @@ class PokemonCatchWorker(Datastore, BaseTask):
 
         #Config
         self.min_ultraball_to_keep = self.config.get('min_ultraball_to_keep', 10)
+        self.berry_threshold = self.config.get('berry_threshold', 0.35)
+        self.vip_berry_threshold = self.config.get('vip_berry_threshold', 0.9)
 
         self.catch_throw_parameters = self.config.get('catch_throw_parameters', {})
         self.catch_throw_parameters_spin_success_rate = self.catch_throw_parameters.get('spin_success_rate', 0.6)
@@ -60,6 +63,7 @@ class PokemonCatchWorker(Datastore, BaseTask):
         self.catch_throw_parameters_great_rate = self.catch_throw_parameters.get('great_rate', 0.5)
         self.catch_throw_parameters_nice_rate = self.catch_throw_parameters.get('nice_rate', 0.3)
         self.catch_throw_parameters_normal_rate = self.catch_throw_parameters.get('normal_rate', 0.1)
+        self.catch_throw_parameters_hit_rate = self.catch_throw_parameters.get('hit_rate', 0.8)
 
         self.catchsim_config = self.config.get('catch_simulation', {})
         self.catchsim_catch_wait_min = self.catchsim_config.get('catch_wait_min', 2)
@@ -127,7 +131,7 @@ class PokemonCatchWorker(Datastore, BaseTask):
         )
 
         # simulate app
-        sleep(3)
+        time.sleep(3)
 
         # check for VIP pokemon
         if is_vip:
@@ -281,6 +285,24 @@ class PokemonCatchWorker(Datastore, BaseTask):
                     level='warning',
                     formatted='Failed to use berry. You may be softbanned.'
                 )
+                with self.bot.database as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT COUNT(name) FROM sqlite_master WHERE type='table' AND name='softban_log'")
+                result = c.fetchone()        
+
+                while True:
+                    if result[0] == 1:
+                        source = str("PokemonCatchWorker")
+                        status = str("Possible Softban")
+                        conn.execute('''INSERT INTO softban_log (status, source) VALUES (?, ?)''', (status, source))
+                    break
+                else:
+                    self.emit_event(
+                        'softban_log',
+                        sender=self,
+                        level='info',
+                        formatted="softban_log table not found, skipping log"
+                    )
 
         # unknown status code
         else:
@@ -303,7 +325,7 @@ class PokemonCatchWorker(Datastore, BaseTask):
         """
         berry_id = ITEM_RAZZBERRY
         maximum_ball = ITEM_ULTRABALL if is_vip else ITEM_GREATBALL
-        ideal_catch_rate_before_throw = 0.9 if is_vip else 0.35
+        ideal_catch_rate_before_throw = self.vip_berry_threshold if is_vip else self.berry_threshold
 
         berry_count = self.inventory.get(ITEM_RAZZBERRY).count
         ball_count = {}
@@ -401,12 +423,16 @@ class PokemonCatchWorker(Datastore, BaseTask):
                 }
             )
 
+            hit_pokemon = 1
+            if random() >= self.catch_throw_parameters_hit_rate:
+                hit_pokemon = 0
+
             response_dict = self.api.catch_pokemon(
                 encounter_id=encounter_id,
                 pokeball=current_ball,
                 normalized_reticle_size=throw_parameters['normalized_reticle_size'],
                 spawn_point_id=self.spawn_point_guid,
-                hit_pokemon=1,
+                hit_pokemon=hit_pokemon,
                 spin_modifier=throw_parameters['spin_modifier'],
                 normalized_hit_position=throw_parameters['normalized_hit_position']
             )
@@ -454,6 +480,7 @@ class PokemonCatchWorker(Datastore, BaseTask):
                 self.bot.metrics.captured_pokemon(pokemon.name, pokemon.cp, pokemon.iv_display, pokemon.iv)
 
                 try:
+                    inventory.pokemons().add(pokemon)
                     self.emit_event(
                         'pokemon_caught',
                         formatted='Captured {pokemon}! [CP {cp}] [NCP {ncp}] [Potential {iv}] [{iv_display}] [+{exp} exp]',
@@ -472,8 +499,22 @@ class PokemonCatchWorker(Datastore, BaseTask):
 
                     )
                     with self.bot.database as conn:
-                        conn.execute('''INSERT INTO catch_log (pokemon, cp, iv, encounter_id, pokemon_id) VALUES (?, ?, ?, ?, ?)''', (pokemon.name, pokemon.cp, pokemon.iv, str(encounter_id), pokemon.pokemon_id))
-                    #conn.commit()
+                        c = conn.cursor()
+                        c.execute("SELECT COUNT(name) FROM sqlite_master WHERE type='table' AND name='catch_log'")
+                    result = c.fetchone()        
+
+                    while True:
+                        if result[0] == 1:
+                            conn.execute('''INSERT INTO catch_log (pokemon, cp, iv, encounter_id, pokemon_id) VALUES (?, ?, ?, ?, ?)''', (pokemon.name, pokemon.cp, pokemon.iv, str(encounter_id), pokemon.pokemon_id))
+                        break
+                    else:
+                        self.emit_event(
+                            'catch_log',
+                            sender=self,
+                            level='info',
+                            formatted="catch_log table not found, skipping log"
+                        )
+                        break
                     user_data_caught = os.path.join(_base_dir, 'data', 'caught-%s.json' % self.bot.config.username)
                     with open(user_data_caught, 'ab') as outfile:
                         outfile.write(str(datetime.now()))
@@ -502,6 +543,17 @@ class PokemonCatchWorker(Datastore, BaseTask):
                 )
 
                 self.bot.softban = False
+
+            elif catch_pokemon_status == CATCH_STATUS_MISSED:
+                self.emit_event(
+                    'pokemon_capture_failed',
+                    formatted='Pokeball thrown to {pokemon} missed.. trying again!',
+                    data={'pokemon': pokemon.name}
+                )
+                # Take some time to throw the ball from config options
+                action_delay(self.catchsim_catch_wait_min, self.catchsim_catch_wait_max)
+                continue
+
             break
 
     def get_candy_gained_count(self, response_dict):
@@ -556,4 +608,3 @@ class PokemonCatchWorker(Datastore, BaseTask):
         throw_parameters['normalized_reticle_size'] = 1.25 + 0.70 * random()
         throw_parameters['normalized_hit_position'] = 0.0
         throw_parameters['throw_type_label'] = 'OK'
-

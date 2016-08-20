@@ -266,7 +266,7 @@ class Pokemons(_BaseInventoryComponent):
         :return: The space used in pokemon inventory.
         :rtype: int
         """
-        return len(_inventory.pokemons.all())
+        return len(_inventory.pokemons.all_with_eggs())
 
     @classmethod
     def get_space_left(cls):
@@ -321,6 +321,10 @@ class Pokemons(_BaseInventoryComponent):
         # by default don't include eggs in all pokemon (usually just
         # makes caller's lives more difficult)
         return [p for p in super(Pokemons, self).all() if not isinstance(p, Egg)]
+
+    def all_with_eggs(self):
+        # count pokemon AND eggs, since eggs are counted as bag space
+        return super(Pokemons, self).all()
 
     def add(self, pokemon):
         if pokemon.unique_id <= 0:
@@ -1079,13 +1083,11 @@ class Inventory(object):
         self.candy = Candies()
         self.items = Items()
         self.pokemons = Pokemons()
-        self.refresh_count = 0
         self.refresh()
         self.item_inventory_size = None
         self.pokemon_inventory_size = None
 
     def refresh(self):
-        self.refresh_count += 1
         inventory = self.bot.api.get_inventory()
         inventory = inventory['responses']['GET_INVENTORY']['inventory_delta']['inventory_items']
         for i in (self.pokedex, self.candy, self.items, self.pokemons):
@@ -1104,12 +1106,11 @@ class Inventory(object):
         :return: Nothing.
         :rtype: None
         """
-        # TODO: Force update of it if the player upgrades its size
+        # TODO: Force to update it if the player upgrades its size
         if self.item_inventory_size is None or self.pokemon_inventory_size is None:
            player_data = self.bot.api.get_player()['responses']['GET_PLAYER']['player_data']
            self.item_inventory_size = player_data['max_item_storage']
            self.pokemon_inventory_size = player_data['max_pokemon_storage']
-
 
 #
 # Other
